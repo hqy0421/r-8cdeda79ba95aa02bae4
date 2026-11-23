@@ -33,6 +33,7 @@ from ._narx_fast import (
     _compute_dydx,
     _compute_term_lib,
     _predict,
+    _session_warmup_mask,
 )
 
 
@@ -250,6 +251,33 @@ class NARX(MultiOutputMixin, RegressorMixin, BaseEstimator):
     max_delay_ : int
         The maximum time delay of the time shift variables.
 
+    session_sizes_ : ndarray of shape (n_sessions,)
+        The size of each measurement session seen during :term:`fit`.
+
+        .. versionadded:: 0.7.0
+
+    n_valid_samples_ : ndarray of shape (n_sessions,)
+        The number of samples of each session that contribute to the fit,
+        i.e. after removing warmup and non-finite rows. A session shorter than
+        :attr:`max_delay_` has zero valid sample.
+
+        .. versionadded:: 0.7.0
+
+    n_excluded_samples_ : ndarray of shape (n_sessions,)
+        The number of excluded samples of each session.
+
+        .. versionadded:: 0.7.0
+
+    exclusion_reasons_ : list of dict of shape (n_sessions,)
+        The number of samples excluded per session and per reason. The reasons
+        are ``"warmup"`` (the row belongs to the first ``max_delay_`` samples
+        of a session or follows a non-finite row of ``X``) and
+        ``"non_finite"`` (the row of ``X`` or ``y`` contains a non-finite value
+        outside the warmup region). A ``"zero_weight"`` reason is added when
+        sample weights are used.
+
+        .. versionadded:: 0.7.0
+
     feat_ids_ : array-like of shape (n_terms, degree)
         The unique id numbers of features to form polynomial terms.
         The id -1 stands for the constant 1.
@@ -448,6 +476,7 @@ class NARX(MultiOutputMixin, RegressorMixin, BaseEstimator):
         self.n_outputs_ = y.shape[1]
         n_samples, n_features = X.shape
 
+        self._has_sample_weight = sample_weight is not None
         sample_weight = _check_sample_weight(
             sample_weight, X, dtype=X.dtype, ensure_non_negative=True
         )
@@ -512,6 +541,32 @@ class NARX(MultiOutputMixin, RegressorMixin, BaseEstimator):
             )
 
         self.max_delay_ = self.delay_ids_.max()
+
+        # Per-session bookkeeping: how many samples of each session actually
+        # contribute to the fit and why the other rows are excluded. A session
+        # shorter than max_delay_ is reported in full as warmup and contributes
+        # no valid sample, instead of being dropped silently.
+        session_summary = _session_warmup_summary(
+            X,
+            y,
+            session_sizes_cumsum,
+            self.max_delay_,
+            sample_weight=sample_weight if self._has_sample_weight else None,
+        )
+        self.session_sizes_ = session_summary["session_sizes"]
+        self.n_valid_samples_ = session_summary["n_valid_samples"]
+        self.n_excluded_samples_ = session_summary["n_excluded_samples"]
+        self.exclusion_reasons_ = session_summary["exclusion_reasons"]
+        if self.max_delay_ > 0 and np.any(self.n_valid_samples_ == 0):
+            empty_sessions = np.flatnonzero(self.n_valid_samples_ == 0)
+            warnings.warn(
+                "The following sessions contain no valid sample and do not "
+                f"contribute to the fit: {empty_sessions.tolist()}. Their "
+                f"size is not larger than the maximum delay {self.max_delay_}, "
+                "so all their rows are used as warmup values.",
+                UserWarning,
+            )
+        self._session_warmup_mask = session_summary["warmup_mask"]
 
         if isinstance(coef_init, (type(None), str)):
             # fit a one-step-ahead NARX model
@@ -1142,10 +1197,11 @@ class NARX(MultiOutputMixin, RegressorMixin, BaseEstimator):
         {
             "X": ["array-like", Interval(Integral, 1, None, closed="left")],
             "y_init": [None, "array-like"],
+            "session_sizes": [None, "array-like"],
         },
         prefer_skip_nested_validation=True,
     )
-    def predict(self, X, y_init=None):
+    def predict(self, X, y_init=None, session_sizes=None):
         """
         Predict using the linear model.
 
@@ -1158,13 +1214,32 @@ class NARX(MultiOutputMixin, RegressorMixin, BaseEstimator):
 
         y_init : array-like of shape (n_init,) or (n_init, `n_outputs_`), default=None
             The initial values for the prediction of y.
-            It should at least have one sample.
+            It should at least have one sample. Every session restarts its
+            warmup from the beginning of `y_init`.
+
+        session_sizes : array-like of shape (n_sessions,), default=None
+            The sizes of measurement sessions for time-series.
+            The sum of session_sizes should be equal to n_samples.
+            If None, the whole data is treated as one session and the warmup
+            rows keep their `y_init` values.
+
+            When given, the first `max_delay_` samples of each session are
+            warmup values copied from `y_init` and then returned as NaN. A
+            session whose size is not larger than :attr:`max_delay_` never
+            leaves the warmup region: all its rows are returned as NaN, so the
+            output keeps the same length as the request and a short session
+            cannot shift the warmup of the next session.
+
+            .. versionadded:: 0.7.0
 
         Returns
         -------
         y_hat : array-like of shape (n_samples,) or (n_samples, `n_outputs_`)
             Returns predicted values. The number of dimensions is the same as that
-            of y in :term:`fit`.
+            of y in :term:`fit`. When `session_sizes` is given, warmup rows of
+            each session, including the whole rows of sessions shorter than
+            :attr:`max_delay_`, are NaN; otherwise the warmup rows hold the
+            `y_init` values.
         """
         check_is_fitted(self)
 
@@ -1205,8 +1280,9 @@ class NARX(MultiOutputMixin, RegressorMixin, BaseEstimator):
                     f"but got {y_init.shape[1]}."
                 )
         n_samples = X.shape[0]
+        sessions_given = session_sizes is not None
+        session_sizes_cumsum = _validate_session_sizes(session_sizes, n_samples)
         y_hat = np.zeros((n_samples, self.n_outputs_), dtype=float)
-        session_sizes_cumsum = np.array([n_samples], dtype=np.int32)
         _predict(
             X,
             y_init,
@@ -1218,7 +1294,23 @@ class NARX(MultiOutputMixin, RegressorMixin, BaseEstimator):
             session_sizes_cumsum,
             self.max_delay_,
             y_hat,
+            local_session_ref=sessions_given,
         )
+        if sessions_given:
+            # Replace the warmup region of every session by NaN. This keeps
+            # the output aligned with the request and makes short sessions
+            # return empty (NaN) slots instead of leaking their initial
+            # values. For a single-session call without session_sizes the
+            # warmup rows keep their initial values for backward
+            # compatibility.
+            warmup_mask = np.zeros(n_samples, dtype=np.uint8)
+            _session_warmup_mask(
+                np.ascontiguousarray(X, dtype=float),
+                session_sizes_cumsum,
+                self.max_delay_,
+                warmup_mask,
+            )
+            y_hat[warmup_mask.astype(bool)] = np.nan
         if self._y_ndim == 1:
             y_hat = y_hat.flatten()
         return y_hat
@@ -1248,6 +1340,165 @@ def _validate_session_sizes(session_sizes, n_samples):
             f"but got {session_sizes.sum()} != {n_samples}."
         )
     return np.cumsum(session_sizes, dtype=np.int32)
+
+
+# Exclusion reasons reported per sample/per session. A sample is excluded from
+# fitting when it is needed as a warmup value or when its data is not finite.
+EXCLUDED_WARMUP = "warmup"
+EXCLUDED_NON_FINITE = "non_finite"
+
+
+def _session_warmup_summary(X, y, session_sizes_cumsum, max_delay, sample_weight=None):
+    """Build per-session bookkeeping of valid and excluded samples.
+
+    The warmup rule is the same one used by the Cython prediction loop:
+
+    * the first ``max_delay`` samples of every session are warmup values
+      (a session shorter than ``max_delay`` is entirely warmup and therefore
+      contributes no valid sample), and
+    * a non-finite row of ``X`` restarts the warmup and is excluded together
+      with the following rows until ``max_delay`` finite rows have been seen
+      again. A non-finite row of ``y`` with finite ``X`` does not restart the
+      warmup; it is reported separately as ``"non_finite"``.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n_samples, n_features)
+    y : ndarray of shape (n_samples, n_outputs)
+    session_sizes_cumsum : ndarray of shape (n_sessions,)
+        Cumulative session sizes (dtype int32).
+    max_delay : int
+        Maximum delay of the selected model.
+    sample_weight : ndarray of shape (n_samples,), default=None
+        When provided, zero-weight samples are additionally reported as
+        excluded.
+
+    Returns
+    -------
+    summary : dict
+        ``warmup_mask``: bool ndarray of shape (n_samples,), True on rows that
+        are excluded by the warmup rule; ``valid_mask``: bool ndarray of the
+        rows that actually contribute to the fit; ``session_sizes``: int
+        ndarray with the size of each session; ``n_valid_samples``: int ndarray
+        with the number of valid samples per session;
+        ``n_excluded_samples``: int ndarray; ``exclusion_reasons``: list of
+        dict, one dict per session, mapping each reason to a sample count.
+    """
+    n_samples = X.shape[0]
+    warmup_mask = np.zeros(n_samples, dtype=np.uint8)
+    _session_warmup_mask(
+        np.ascontiguousarray(X, dtype=float),
+        np.ascontiguousarray(session_sizes_cumsum, dtype=np.int32),
+        int(max_delay),
+        warmup_mask,
+    )
+    warmup_mask = warmup_mask.astype(bool)
+    non_finite_mask = ~(np.all(np.isfinite(X), axis=1) & np.all(np.isfinite(y), axis=1))
+    valid_mask = ~warmup_mask & ~non_finite_mask
+    if sample_weight is not None:
+        zero_weight_mask = np.asarray(sample_weight).reshape(-1) == 0
+        valid_mask &= ~zero_weight_mask
+    else:
+        zero_weight_mask = np.zeros(n_samples, dtype=bool)
+
+    cumsum = np.asarray(session_sizes_cumsum)
+    starts = np.r_[0, cumsum[:-1]]
+    session_sizes = cumsum - starts
+    n_valid = np.empty(len(cumsum), dtype=np.int64)
+    n_excluded = np.empty(len(cumsum), dtype=np.int64)
+    reasons = []
+    for i, (start, end) in enumerate(zip(starts, cumsum)):
+        session_warmup = warmup_mask[start:end]
+        session_non_finite = non_finite_mask[start:end]
+        session_zero_weight = zero_weight_mask[start:end]
+        n_valid[i] = int(valid_mask[start:end].sum())
+        reason = {
+            EXCLUDED_WARMUP: int(session_warmup.sum()),
+            EXCLUDED_NON_FINITE: int((session_non_finite & ~session_warmup).sum()),
+        }
+        if sample_weight is not None:
+            reason["zero_weight"] = int(
+                (session_zero_weight & ~session_warmup & ~session_non_finite).sum()
+            )
+        reasons.append(reason)
+        n_excluded[i] = int(sum(reason.values()))
+
+    return {
+        "warmup_mask": warmup_mask,
+        "valid_mask": valid_mask,
+        "session_sizes": session_sizes.astype(np.int64),
+        "n_valid_samples": n_valid,
+        "n_excluded_samples": n_excluded,
+        "exclusion_reasons": reasons,
+    }
+
+
+def _summarize_session_masks(
+    warmup_mask,
+    valid_mask,
+    session_sizes_cumsum,
+    non_finite_mask=None,
+):
+    """Rebuild per-session counts and exclusion reasons from row masks.
+
+    Parameters
+    ----------
+    warmup_mask : bool ndarray of shape (n_samples,)
+        Rows excluded by the session-local warmup rule.
+    valid_mask : bool ndarray of shape (n_samples,)
+        Rows actually retained by the caller (e.g. candidate selection).
+    session_sizes_cumsum : int ndarray of shape (n_sessions,)
+        Cumulative session sizes.
+    non_finite_mask : bool ndarray of shape (n_samples,), default=None
+        Rows whose raw ``X`` or ``y`` is non-finite. When given, excluded rows
+        outside the warmup region are split into ``"non_finite"`` and
+        ``"missing_propagated"`` (a finite row whose delayed term is missing
+        because an earlier row of the same session was non-finite).
+
+    Returns
+    -------
+    summary : dict
+        Same keys as :func:`_session_warmup_summary`.
+    """
+    n_samples = warmup_mask.shape[0]
+    if non_finite_mask is None:
+        non_finite_mask = np.zeros(n_samples, dtype=bool)
+    warmup_mask = np.asarray(warmup_mask, dtype=bool)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    non_finite_mask = np.asarray(non_finite_mask, dtype=bool)
+
+    cumsum = np.asarray(session_sizes_cumsum)
+    starts = np.r_[0, cumsum[:-1]]
+    session_sizes = cumsum - starts
+    n_valid = np.empty(len(cumsum), dtype=np.int64)
+    n_excluded = np.empty(len(cumsum), dtype=np.int64)
+    reasons = []
+    for i, (start, end) in enumerate(zip(starts, cumsum)):
+        session_warmup = warmup_mask[start:end]
+        session_valid = valid_mask[start:end]
+        session_non_finite = non_finite_mask[start:end]
+        n_valid[i] = int(session_valid.sum())
+        excluded = ~session_valid
+        n_warmup = int((excluded & session_warmup).sum())
+        n_non_finite = int((excluded & ~session_warmup & session_non_finite).sum())
+        n_propagated = int((excluded & ~session_warmup & ~session_non_finite).sum())
+        reason = {
+            EXCLUDED_WARMUP: n_warmup,
+            EXCLUDED_NON_FINITE: n_non_finite,
+        }
+        if n_propagated:
+            reason["missing_propagated"] = n_propagated
+        reasons.append(reason)
+        n_excluded[i] = int(excluded.sum())
+
+    return {
+        "warmup_mask": warmup_mask,
+        "valid_mask": valid_mask,
+        "session_sizes": session_sizes.astype(np.int64),
+        "n_valid_samples": n_valid,
+        "n_excluded_samples": n_excluded,
+        "exclusion_reasons": reasons,
+    }
 
 
 def _prepare_poly_terms(

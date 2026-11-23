@@ -188,10 +188,28 @@ cpdef void _predict(
     const int[::1] session_sizes_cumsum,    # IN
     const int max_delay,                    # IN
     double[:, ::1] y_hat,                   # OUT
+    bint local_session_ref=False,           # IN
 ) noexcept nogil:
     """
     Vectorized (Cython) variant of Python NARX._predict.
     Returns y_hat array (n_samples, n_outputs).
+
+    Explicit session boundaries (``session_sizes_cumsum``) and non-finite rows
+    of ``X`` both restart the warmup. The way ``y_ref`` is indexed during a
+    warmup depends on ``local_session_ref``:
+
+    * ``local_session_ref=False`` (used by :term:`fit`): ``y_ref`` holds the
+      full concatenated record, so the global index ``k % n_ref`` reads each
+      session's own measured rows. A short session therefore cannot shift the
+      warmup of the next session, because every row is read at its own index.
+    * ``local_session_ref=True`` (used by predict with explicit sessions):
+      ``y_ref`` is a compact initial-value buffer, and every session restarts
+      from its first element using the session-local position
+      ``(k - init_k) % n_ref``.
+
+    The Python layer marks the rows of short explicit sessions as NaN
+    afterwards (see ``_session_warmup_mask``), which keeps the output aligned
+    with the request.
     """
     cdef:
         Py_ssize_t n_samples = X.shape[0]
@@ -215,7 +233,13 @@ cpdef void _predict(
             at_init = False
 
         if at_init:
-            y_hat[k] = y_ref[k % n_ref]
+            if local_session_ref:
+                # Compact per-session initial buffer: restart at y_ref[0] for
+                # every session, even after a session shorter than max_delay.
+                y_hat[k] = y_ref[(k - init_k) % n_ref]
+            else:
+                # Full record: read each session's own measured row.
+                y_hat[k] = y_ref[k % n_ref]
             with gil:
                 if not np.all(np.isfinite(y_hat[k])):
                     at_init = True
@@ -236,6 +260,51 @@ cpdef void _predict(
         with gil:
             if np.max(np.abs(y_hat[k])) > 1e20:
                 break
+
+
+@final
+cpdef void _session_warmup_mask(
+    const double[:, ::1] X,                 # IN
+    const int[::1] session_sizes_cumsum,    # IN
+    const int max_delay,                    # IN
+    unsigned char[::1] warmup_mask,         # OUT, True on warmup/excluded rows
+) noexcept nogil:
+    """
+    Mark the rows that belong to the warmup region of each session.
+
+    A row is marked when either
+
+    * its session-local position is smaller than ``max_delay`` (the model
+      consumes the first ``max_delay`` samples of every session as initial
+      values; a session shorter than ``max_delay`` is therefore marked in
+      full), or
+    * the corresponding row of ``X`` contains a non-finite value, which
+      restarts the warmup inside a session.
+
+    The mask is session-local: boundaries come from
+    ``session_sizes_cumsum``, so a short session never shifts the warmup
+    region of the next session.
+    """
+    cdef:
+        Py_ssize_t n_samples = X.shape[0]
+        Py_ssize_t k, s = 0
+        Py_ssize_t init_k = 0
+        bint at_init = True
+
+    for k in range(n_samples):
+        if s < session_sizes_cumsum.shape[0] and k == session_sizes_cumsum[s]:
+            s += 1
+            at_init = True
+            init_k = k
+        with gil:
+            if not np.all(np.isfinite(X[k])):
+                at_init = True
+                init_k = k + 1
+                warmup_mask[k] = True
+                continue
+        if k - init_k == max_delay:
+            at_init = False
+        warmup_mask[k] = at_init
 
 
 @final

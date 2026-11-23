@@ -3,6 +3,7 @@
 # Authors: The fastcan developers
 # SPDX-License-Identifier: MIT
 
+import warnings
 from functools import partial
 from numbers import Integral
 
@@ -25,7 +26,13 @@ from .._fastcan import FastCan
 from .._lazyfastcan import LazyFastCan, _skip2valid
 from .._refine import refine
 from ..utils import mask_missing_values
-from ._base import NARX, _prepare_poly_terms, _validate_session_sizes
+from ._base import (
+    NARX,
+    _prepare_poly_terms,
+    _session_warmup_summary,
+    _summarize_session_masks,
+    _validate_session_sizes,
+)
 from ._feature import (
     _make_a_time_shift_feature,
     make_poly_ids,
@@ -161,6 +168,7 @@ def print_narx(
             None,
             Interval(Integral, 1, None, closed="left"),
         ],
+        "return_report": ["boolean"],
     },
     prefer_skip_nested_validation=True,
 )
@@ -182,6 +190,7 @@ def make_narx(
     refine_verbose=1,
     refine_drop=None,
     refine_max_iter=None,
+    return_report=False,
     **params,
 ):
     """Find `time_shift_ids`, `poly_ids`, `output_ids` for a NARX model.
@@ -257,6 +266,15 @@ def make_narx(
         The maximum number of valid iterations in the refining process.
         Only available when `lazy` is False.
 
+    return_report : bool, default=False
+        If True, additionally return a report recording, for each measurement
+        session, the number of samples retained for candidate selection and
+        the number of samples excluded together with the reason (``"warmup"``
+        or ``"non_finite"``). Sessions shorter than `max_delay` are reported
+        with zero retained sample instead of being silently discarded.
+
+        .. versionadded:: 0.7.0
+
     **params : dict
             Keyword arguments passed to
             `fastcan.FastCan`.
@@ -265,7 +283,11 @@ def make_narx(
     Returns
     -------
     narx : NARX
-        NARX instance.
+        NARX instance. When `return_report` is True, a tuple
+        ``(narx, report)`` is returned, where ``report`` is a dict with keys
+        ``session_sizes``, ``n_valid_samples``, ``n_excluded_samples`` and
+        ``exclusion_reasons``. The same bookkeeping is also stored on the
+        returned NARX as the ``session_report_`` attribute.
 
     Examples
     --------
@@ -344,6 +366,27 @@ def make_narx(
             )
     session_sizes_cumsum = _validate_session_sizes(session_sizes, n_samples)
 
+    # Session-local warmup bookkeeping. A session shorter than max_delay is
+    # entirely warmup and retains no sample; it is reported (see
+    # session_report_) instead of being dropped silently. The raw-data mask is
+    # refined below with the mask actually applied by each selection path, so
+    # rows dropped because a missing value propagated through delayed terms are
+    # accounted for as well.
+    X_np = (
+        move_to(X, xp=np, device="cpu") if X is not None else np.empty((n_samples, 0))
+    )
+    y_np = move_to(y, xp=np, device="cpu")
+    base_summary = _session_warmup_summary(
+        np.ascontiguousarray(X_np, dtype=float),
+        np.ascontiguousarray(y_np, dtype=float),
+        session_sizes_cumsum,
+        max_delay,
+    )
+    warmup_mask_np = base_summary["warmup_mask"]
+    raw_non_finite_mask = ~(
+        np.all(np.isfinite(X_np), axis=1) & np.all(np.isfinite(y_np), axis=1)
+    )
+
     if include_zero_delay is None:
         _include_zero_delay = [True] * n_features + [False] * n_outputs
     else:
@@ -374,9 +417,19 @@ def make_narx(
     )
 
     if lazy:
-        sample_mask = xp.ones(n_samples, dtype=xp.bool, device=device_)
-        for start in session_sizes_cumsum[:-1]:
-            sample_mask[start : start + max_delay] = False
+        # Exclude every warmup row (including the first session's warmup and
+        # the whole rows of sessions shorter than max_delay) and every
+        # non-finite row. The mask is session-local, so a short session cannot
+        # shift the warmup region of the next session. Generated features pad
+        # delayed values with 0.0 instead of NaN, so missing values do not
+        # propagate beyond the raw non-finite rows.
+        valid_mask_np = ~warmup_mask_np & ~raw_non_finite_mask
+        sample_mask = xp.asarray(valid_mask_np, device=device_)
+        # LazyFastCan validates its inputs before applying sample_mask, so the
+        # non-finite rows must be removed beforehand; the feature generator is
+        # then bound to the compressed record and sees all its rows.
+        xy_hstack_masked = xy_hstack[sample_mask]
+        y_masked_lazy = y[sample_mask]
         gen_terms = partial(
             _gen_poly_time_shift_terms,
             time_shift_ids=time_shift_ids_all,
@@ -390,12 +443,17 @@ def make_narx(
             csf = LazyFastCan(
                 n_features_to_select=n_terms_to_select[i],
                 feature_generator=gen_terms,
-                sample_mask=sample_mask,
-            ).fit(xy_hstack, y[:, i])
+            ).fit(xy_hstack_masked, y_masked_lazy[:, i])
             selected_ids = csf.indices_
             selected_ids = xp.sort(selected_ids)
             selected_ids = move_to(selected_ids, xp=np, device="cpu")
             selected_poly_ids.append(poly_ids_all[selected_ids])
+        session_summary = _summarize_session_masks(
+            warmup_mask_np,
+            valid_mask_np,
+            session_sizes_cumsum,
+            non_finite_mask=raw_non_finite_mask,
+        )
     else:
         poly_terms = _prepare_poly_terms(
             xy_hstack,
@@ -405,10 +463,20 @@ def make_narx(
             max_delay,
             xp=xp,
         )
-        # Remove missing values
+        # Remove missing values. This is the authoritative valid-row mask of
+        # the eager path: besides warmup and raw non-finite rows, it also
+        # drops finite rows whose delayed terms inherit a missing value.
+        eager_valid_mask = mask_missing_values(poly_terms, y, return_mask=True)
+        eager_valid_mask = move_to(eager_valid_mask, xp=np, device="cpu")
         poly_terms_masked, y_masked = mask_missing_values(poly_terms, y)
         poly_terms_masked = move_to(poly_terms_masked, xp=np, device="cpu")
         y_masked = move_to(y_masked, xp=np, device="cpu")
+        session_summary = _summarize_session_masks(
+            warmup_mask_np,
+            eager_valid_mask,
+            session_sizes_cumsum,
+            non_finite_mask=raw_non_finite_mask,
+        )
 
         selected_poly_ids = []
         for i in range(n_outputs):
@@ -429,6 +497,18 @@ def make_narx(
                 support = csf.get_support()
             selected_poly_ids.append(poly_ids_all[support])
 
+    if max_delay > 0 and np.any(session_summary["n_valid_samples"] == 0):
+        empty_sessions = np.flatnonzero(
+            session_summary["n_valid_samples"] == 0
+        ).tolist()
+        warnings.warn(
+            "The following sessions contain no valid sample for candidate "
+            f"selection and are excluded in full: {empty_sessions}. Their "
+            f"size is not larger than the maximum delay {max_delay}, so all "
+            "their rows are used as warmup values.",
+            UserWarning,
+        )
+
     selected_poly_ids = np.vstack(selected_poly_ids)
 
     time_shift_ids = time_shift_ids_all[
@@ -445,12 +525,22 @@ def make_narx(
     output_ids = [i for i in range(n_outputs) for _ in range(n_terms_to_select[i])]
     feat_ids, delay_ids = tp2fd(time_shift_ids, poly_ids)
 
-    return NARX(
+    narx = NARX(
         feat_ids=feat_ids,
         delay_ids=delay_ids,
         output_ids=output_ids,
         fit_intercept=fit_intercept,
     )
+    # Candidate-filter bookkeeping, available before fit() as well.
+    narx.session_report_ = {
+        "session_sizes": session_summary["session_sizes"],
+        "n_valid_samples": session_summary["n_valid_samples"],
+        "n_excluded_samples": session_summary["n_excluded_samples"],
+        "exclusion_reasons": session_summary["exclusion_reasons"],
+    }
+    if return_report:
+        return narx, narx.session_report_
+    return narx
 
 
 def _gen_poly_time_shift_terms(

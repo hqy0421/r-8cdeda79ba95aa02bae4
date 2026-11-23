@@ -15,6 +15,13 @@ def _predict(
     session_sizes_cumsum: npt.NDArray[np.intc],
     max_delay: int,
     y_hat: npt.NDArray[np.float64],
+    local_session_ref: bool = ...,
+) -> None: ...
+def _session_warmup_mask(
+    X: npt.NDArray[np.float64],
+    session_sizes_cumsum: npt.NDArray[np.intc],
+    max_delay: int,
+    warmup_mask: npt.NDArray[np.uint8],
 ) -> None: ...
 def _compute_term_lib(
     X: npt.NDArray[np.float64],

@@ -72,6 +72,28 @@ The following examples show how to notify :class:`NARX` the training data from d
     separate the two measurement sessions.
     Because when using multiple-step-ahead prediction, the optimiser relies on the missing values in inputs `X` rather than output `y`, while Auto-Regression models do not have input `X`.
 
+.. note::
+    A measurement session can be shorter than the maximum delay of the model.
+    Such a session only provides warmup values and contributes no valid
+    sample: the first `max_delay` rows of every session are consumed as
+    initial values, so a session whose size is not larger than `max_delay`
+    is excluded in full. Instead of being dropped silently, these sessions are
+    recorded on the fitted model through ``session_sizes_``,
+    ``n_valid_samples_``, ``n_excluded_samples_`` and ``exclusion_reasons_``,
+    and :func:`make_narx` exposes the same bookkeeping through
+    ``return_report=True`` (also available as the ``session_report_``
+    attribute of the returned model). The exclusion reasons are ``"warmup"``,
+    ``"non_finite"`` and, when missing values propagate through delayed terms,
+    ``"missing_propagated"``.
+
+    When predicting several sessions at once, pass ``session_sizes`` to
+    :meth:`NARX.predict`. Each session restarts its warmup from the beginning
+    of `y_init`, so a short session can never shift the warmup of the next
+    session. The warmup rows, including all rows of sessions shorter than
+    `max_delay`, are returned as ``np.nan``; the output therefore keeps the
+    same length as the request, with empty slots aligned to the short
+    sessions.
+
 
 One-step-ahead and multiple-step-ahead prediction
 =================================================

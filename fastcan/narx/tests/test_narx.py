@@ -1,5 +1,7 @@
 """Test NARX"""
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -888,3 +890,209 @@ def test_session_sizes():
     ar_coef_missing_msa = arm.coef_
     # Not same for multi-step-ahead fitting
     assert np.sum(np.abs(ar_coef_session_msa - ar_coef_missing_msa)) != 0
+
+
+def _short_session_data():
+    """Sessions [10, 2 (shorter than max_delay=3), 8]."""
+    rng = np.random.default_rng(7)
+    session_sizes = [10, 2, 8]
+    n_samples = sum(session_sizes)
+    X = rng.random((n_samples, 2))
+    y = rng.random(n_samples)
+    return rng, X, y, session_sizes
+
+
+def test_fit_short_session_bookkeeping():
+    """fit leaves per-session valid counts and exclusion reasons."""
+    _, X, y, session_sizes = _short_session_data()
+    feat_ids = np.array([[1], [1], [0]], dtype=np.int32)
+    delay_ids = np.array([[1], [3], [0]], dtype=np.int32)
+    narx = NARX(feat_ids=feat_ids, delay_ids=delay_ids)
+    with pytest.warns(UserWarning, match="no valid sample"):
+        narx.fit(X, y, session_sizes=session_sizes)
+
+    assert_array_equal(narx.session_sizes_, session_sizes)
+    assert_array_equal(narx.n_valid_samples_, [7, 0, 5])
+    assert_array_equal(narx.n_excluded_samples_, [3, 2, 3])
+    assert narx.exclusion_reasons_[1] == {"warmup": 2, "non_finite": 0}
+    # the short session contributes no row to the fit
+    assert narx.n_valid_samples_.sum() == 12
+
+
+def test_fit_short_session_non_finite_reason():
+    """A non-finite y row outside the warmup region is reported separately."""
+    _, X, y, session_sizes = _short_session_data()
+    y = y.copy()
+    y[6] = np.nan
+    feat_ids = np.array([[1], [1], [0]], dtype=np.int32)
+    delay_ids = np.array([[1], [3], [0]], dtype=np.int32)
+    with pytest.warns(UserWarning):
+        narx = NARX(feat_ids=feat_ids, delay_ids=delay_ids).fit(
+            X, y, session_sizes=session_sizes
+        )
+    assert narx.exclusion_reasons_[0] == {"warmup": 3, "non_finite": 1}
+    assert narx.n_valid_samples_[0] == 6
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+def test_make_narx_short_session_report(lazy):
+    """Candidate selection keeps the same per-session bookkeeping on both paths."""
+    _, X, y, session_sizes = _short_session_data()
+    kwargs = {
+        "n_terms_to_select": 3,
+        "max_delay": 3,
+        "poly_degree": 2,
+        "session_sizes": session_sizes,
+    }
+
+    def build(**extra):
+        if lazy:
+            return make_narx(X, y, lazy=True, batch_size=5, **kwargs, **extra)
+        return make_narx(X, y, verbose=0, **kwargs, **extra)
+
+    with pytest.warns(UserWarning, match="no valid sample"):
+        narx, report = build(return_report=True)
+    assert_array_equal(report["session_sizes"], session_sizes)
+    assert_array_equal(report["n_valid_samples"], [7, 0, 5])
+    assert_array_equal(report["n_excluded_samples"], [3, 2, 3])
+    assert report["exclusion_reasons"][1] == {"warmup": 2, "non_finite": 0}
+    # the report is also attached to the unfitted NARX
+    assert narx.session_report_ == report
+    # default return value stays a bare NARX
+    with pytest.warns(UserWarning):
+        bare = build()
+    assert isinstance(bare, NARX)
+
+
+def test_predict_short_session_nan_slots():
+    """predict returns NaN slots aligned with the request for short sessions."""
+    rng, X, y, session_sizes = _short_session_data()
+    feat_ids = np.array([[1], [1], [0]], dtype=np.int32)
+    delay_ids = np.array([[1], [3], [0]], dtype=np.int32)
+    narx = NARX(feat_ids=feat_ids, delay_ids=delay_ids)
+    with pytest.warns(UserWarning):
+        narx.fit(X, y, session_sizes=session_sizes)
+
+    Xp = rng.random((X.shape[0], 2))
+    y_init = rng.random((narx.max_delay_, 1))
+    y_hat = narx.predict(Xp, y_init=y_init, session_sizes=session_sizes)
+    assert y_hat.shape == (X.shape[0],)
+    # the whole short session is NaN
+    assert np.all(np.isnan(y_hat[10:12]))
+    # warmup rows of the other sessions are NaN as well
+    assert np.all(np.isnan(y_hat[0:3]))
+    assert np.all(np.isnan(y_hat[12:15]))
+    # every other row is a finite prediction
+    assert np.all(np.isfinite(np.delete(y_hat, [0, 1, 2, 10, 11, 12, 13, 14])))
+
+
+def test_predict_short_session_does_not_shift_next_session():
+    """A short session must not mismatch the start of the next session."""
+    rng, X, y, session_sizes = _short_session_data()
+    feat_ids = np.array([[1], [1], [0]], dtype=np.int32)
+    delay_ids = np.array([[1], [3], [0]], dtype=np.int32)
+    narx = NARX(feat_ids=feat_ids, delay_ids=delay_ids)
+    with pytest.warns(UserWarning):
+        narx.fit(X, y, session_sizes=session_sizes)
+
+    Xp = rng.random((X.shape[0], 2))
+    y_init = rng.random((narx.max_delay_, 1))
+    y_hat = narx.predict(Xp, y_init=y_init, session_sizes=session_sizes)
+    # The last session predicted standalone must restart from y_init[0] and
+    # therefore match the same rows of the multi-session prediction.
+    y_hat_standalone = narx.predict(Xp[12:20], y_init=y_init)
+    assert_allclose(y_hat[15:20], y_hat_standalone[3:], rtol=1e-12, atol=1e-12)
+
+
+def test_predict_without_session_sizes_keeps_warmup_values():
+    """Backward compatibility: single-session predict keeps y_init warmup rows."""
+    rng = np.random.default_rng(11)
+    X = rng.random((20, 1))
+    y = rng.random(20)
+    feat_ids = np.array([[1], [0]], dtype=np.int32)
+    delay_ids = np.array([[1], [0]], dtype=np.int32)
+    narx = NARX(feat_ids=feat_ids, delay_ids=delay_ids).fit(X, y)
+    y_init = rng.random((narx.max_delay_, 1))
+    y_hat = narx.predict(X, y_init=y_init)
+    assert_allclose(y_hat[: narx.max_delay_], y_init.ravel())
+    assert np.all(np.isfinite(y_hat))
+
+
+def test_fit_session_zero_weight_reason():
+    """Zero-weight rows outside warmup are reported with their own reason."""
+    _, X, y, session_sizes = _short_session_data()
+    feat_ids = np.array([[1], [0]], dtype=np.int32)
+    delay_ids = np.array([[1], [0]], dtype=np.int32)
+    sample_weight = np.ones(X.shape[0])
+    # row 5 is a valid (non-warmup) row of the first session
+    sample_weight[5] = 0.0
+    narx = NARX(feat_ids=feat_ids, delay_ids=delay_ids).fit(
+        X,
+        y,
+        sample_weight=sample_weight,
+        session_sizes=session_sizes,
+    )
+    reason0 = narx.exclusion_reasons_[0]
+    assert reason0["zero_weight"] == 1
+    assert narx.exclusion_reasons_[2]["zero_weight"] == 0
+    # session 0 has 9 valid rows with max_delay=1, one is zero-weighted
+    assert narx.n_valid_samples_[0] == 8
+
+
+def test_predict_auto_regressive_short_session():
+    """Integer-step AR predict handles short sessions with NaN slots."""
+    rng = np.random.default_rng(5)
+    n_samples = 20
+    max_delay = 2
+    y = np.zeros(n_samples)
+    for i in range(1, n_samples):
+        y[i] = 0.6 * y[i - 1] + rng.normal(0, 0.05)
+    session_sizes = [10, 2, 8]
+
+    arm = make_narx(
+        None,
+        y,
+        n_terms_to_select=2,
+        max_delay=max_delay,
+        poly_degree=1,
+        verbose=0,
+    )
+    with pytest.warns(UserWarning, match="no valid sample"):
+        arm.fit(None, y, session_sizes=session_sizes)
+    assert_array_equal(arm.n_valid_samples_, [8, 0, 6])
+
+    y_init = y[:max_delay].reshape(-1, 1)
+    y_hat = arm.predict(n_samples, y_init=y_init, session_sizes=session_sizes)
+    assert y_hat.shape == (n_samples,)
+    assert np.all(np.isnan(y_hat[10:12]))
+    assert np.all(np.isnan(y_hat[0:2]))
+    assert np.all(np.isnan(y_hat[12:14]))
+    assert np.all(np.isfinite(np.delete(y_hat, [0, 1, 10, 11, 12, 13])))
+    # the last session is not shifted by the short session before it
+    standalone = arm.predict(8, y_init=y_init)
+    assert_allclose(y_hat[14:20], standalone[2:], rtol=1e-12, atol=1e-12)
+
+
+def test_make_narx_missing_propagated_reason():
+    """A y NaN excludes its row plus rows whose delayed terms inherit it."""
+    rng = np.random.default_rng(9)
+    X = rng.random((30, 2))
+    y = rng.random(30)
+    y[10] = np.nan
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        _, report = make_narx(
+            X,
+            y,
+            n_terms_to_select=3,
+            max_delay=3,
+            poly_degree=2,
+            return_report=True,
+            verbose=0,
+        )
+    assert not any("no valid sample" in str(w.message) for w in record)
+    reason = report["exclusion_reasons"][0]
+    assert reason["non_finite"] == 1
+    assert reason["missing_propagated"] == 3
+    assert reason["warmup"] == 3
+    assert report["n_valid_samples"][0] == 23
